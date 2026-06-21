@@ -4,7 +4,14 @@ from datetime import datetime
 import random
 import asyncio
 import json
+import os
 import paho.mqtt.client as mqtt
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 app = FastAPI(title="Foll Device Simulator + MQTT", version="2.0.0")
 
@@ -38,20 +45,32 @@ devices_state = {
 
 # -------------------------------------------------------------------------->>
 
-# --- CONFIGURACIÓN MQTT ---
-MQTT_BROKER = "localhost"
-MQTT_PORT = 1883
-mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, "Foll_Sim_Cinturones")
+# --- CONFIGURACIÓN MQTT (Edge → broker local o Azure) ---
+MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "").strip()
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+
+
+def _create_mqtt_client() -> mqtt.Client:
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, "Foll_Sim_Cinturones")
+    if MQTT_USERNAME:
+        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD or None)
+    return client
+
+
+mqtt_client = _create_mqtt_client()
 state_lock = asyncio.Lock()
 
-# @app.on_event("startup")
-def startup_event():
+
+def connect_mqtt() -> None:
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
     mqtt_client.loop_start()
-    print("✅ Conectado al Broker MQTT")
+    auth_hint = f" (user={MQTT_USERNAME})" if MQTT_USERNAME else " (sin auth)"
+    print(f"Conectado al broker MQTT {MQTT_BROKER}:{MQTT_PORT}{auth_hint}")
 
-# @app.on_event("shutdown")
-def shutdown_event():
+
+def disconnect_mqtt() -> None:
     mqtt_client.loop_stop()
     mqtt_client.disconnect()
 
@@ -274,14 +293,12 @@ async def cancel_fall(device_id: int):
 
 
 @app.on_event("startup")
-async def startup_event():
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
-    mqtt_client.loop_start()
-    # ESTA LÍNEA ES VITAL PARA QUE EL BUCLE EMPIECE
-    asyncio.create_task(heartbeat_loop()) 
-    print("✅ Conectado y automatización iniciada")
+async def on_startup():
+    connect_mqtt()
+    asyncio.create_task(heartbeat_loop())
+    print("Automatizacion de heartbeats iniciada")
+
 
 @app.on_event("shutdown")
-def shutdown_event():
-    mqtt_client.loop_stop()
-    mqtt_client.disconnect()
+def on_shutdown():
+    disconnect_mqtt()
