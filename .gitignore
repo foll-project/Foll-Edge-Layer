@@ -1,0 +1,16 @@
+
+venv/
+env/
+ENV/
+
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+.env
+*.secret
+
+.vscode/
+.DS_Store
+Thumbs.db
