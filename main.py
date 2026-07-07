@@ -26,7 +26,7 @@ FALL_TYPES = [
 def get_random_fall_type():
     return random.choice(FALL_TYPES)
 
-DEV_MODE = os.getenv("FOLL_DEV_MODE", "true").lower() in ("1", "true", "yes")
+DEV_MODE = os.getenv("FOLL_DEV_MODE", "false").lower() in ("1", "true", "yes")
 
 BROKER_IP = os.getenv("MQTT_BROKER_HOST", "127.0.0.1")
 MQTT_PORT_BACK = int(os.getenv("MQTT_BACK_PORT", "1884"))
@@ -39,7 +39,28 @@ IOT_TOPIC_PREFIX = "iot/dispositivo_foll/"
 
 devices_state = {}
 edge_location = {"lat": 0.0, "lng": 0.0, "address": ""}
+location_service: LocationService | None = None
 state_lock = asyncio.Lock()
+
+
+def refresh_device_location(device_id: int) -> dict:
+    """Obtiene ubicación actual (Google) y la guarda en el estado del dispositivo."""
+    global edge_location
+
+    if location_service is None:
+        return ensure_device(device_id)
+
+    ubicacion = location_service.update_edge_location()
+    edge_location = {
+        "lat": ubicacion["latitude"],
+        "lng": ubicacion["longitude"],
+        "address": ubicacion["address"],
+    }
+
+    state = ensure_device(device_id)
+    state["location"] = {"lat": edge_location["lat"], "lng": edge_location["lng"]}
+    state["address"] = edge_location["address"]
+    return state
 
 
 def parse_iot_device_id(topic: str) -> int | None:
@@ -91,25 +112,59 @@ def publish_mqtt(topic: str, data: dict):
     print(f"📡 MQTT PUBLISH (Back) -> {topic} | Data: {payload}")
 
 
-def handle_user_cancel(device_id: int, timestamp: str | None = None) -> bool:
-    """Cierra la alerta activa: backend + comando al ESP32 para apagar buzzer."""
+def reset_fall_alert(device_id: int, source: str, *, notify_backend: bool = False, timestamp: str | None = None) -> bool:
+    """Resetea is_falling en Edge y apaga el buzzer del ESP32."""
     state = devices_state.get(device_id)
     if not state or not state.get("is_falling"):
-        print(f"⚠️ [Edge] Cancel ignorada: no hay caída activa (dispositivo {device_id})")
+        print(f"⚠️ [Edge] Reset ignorado: no hay caída activa (dispositivo {device_id}, origen={source})")
         return False
 
     state["is_falling"] = False
-    print(f"🟢 [Edge] Caída cancelada (dispositivo {device_id}). Reseteando estado IA.")
+    print(f"🟢 [Edge] Caída cerrada ({source}, dispositivo {device_id}). Reseteando estado IA.")
 
-    ts = timestamp or datetime.utcnow().isoformat() + "Z"
-    back_payload = {
-        "device_id": device_id,
-        "timestamp": ts,
-        "reason": "USER_BUTTON_PRESSED",
-    }
-    publish_mqtt(f"foll/devices/{device_id}/fall-cancelled", back_payload)
     publish_mqtt_iot(f"iot/dispositivo_foll/{device_id}/comandos", {"accion": "cancelar_caida"})
+
+    if notify_backend:
+        ts = timestamp or datetime.utcnow().isoformat() + "Z"
+        back_payload = {
+            "device_id": device_id,
+            "timestamp": ts,
+            "reason": "USER_BUTTON_PRESSED",
+        }
+        publish_mqtt(f"foll/devices/{device_id}/fall-cancelled", back_payload)
+
     return True
+
+
+def handle_user_cancel(device_id: int, timestamp: str | None = None) -> bool:
+    """Cierra la alerta activa iniciada por el botón del ESP32."""
+    return reset_fall_alert(device_id, "botón ESP32", notify_backend=True, timestamp=timestamp)
+
+
+def handle_incident_closed_from_backend(device_id: int, payload: dict) -> None:
+    """El cuidador cerró el incidente desde la web; el backend ya persistió el cierre."""
+    status = payload.get("status", "Unknown")
+    reason = payload.get("cancellation_reason") or payload.get("reason")
+    source = f"backend ({status}" + (f", {reason})" if reason else ")")
+    reset_fall_alert(device_id, source, notify_backend=False)
+
+
+def on_message_back(client, userdata, msg):
+    topic = msg.topic
+    if not topic.endswith("/incident-closed"):
+        return
+
+    try:
+        payload = json.loads(msg.payload.decode())
+        device_id = parse_foll_device_id(topic) or payload.get("device_id")
+        if device_id is None:
+            print(f"⚠️ incident-closed sin device_id: {topic}")
+            return
+        device_id = int(device_id)
+        ensure_device(device_id)
+        handle_incident_closed_from_backend(device_id, payload)
+    except Exception as e:
+        print(f"⚠️ Error procesando incident-closed: {e}")
 
 
 # --- CALLBACK PRINCIPAL MQTT ---
@@ -141,6 +196,8 @@ def on_message_iot(client, userdata, msg):
                 return
 
             state["is_falling"] = True
+
+            state = refresh_device_location(device_id)
 
             publish_mqtt_iot(f"iot/dispositivo_foll/{device_id}/comandos", {"accion": "caida"})
 
@@ -242,12 +299,15 @@ async def cancel_fall(device_id: int):
 
 @app.on_event("startup")
 async def startup_event():
-    global edge_location
+    global edge_location, location_service
 
     if DEV_MODE:
-        print("🔧 Modo desarrollo activo (FOLL_DEV_MODE=true). MQTT local + ubicación hardcodeada.")
-    loc_service = LocationService(dev_mode=DEV_MODE)
-    ubicacion = loc_service.update_edge_location()
+        print("🔧 Modo desarrollo activo (FOLL_DEV_MODE=true). Ubicación hardcodeada.")
+    else:
+        print("🌍 Geolocalización Google activa (FOLL_DEV_MODE=false).")
+
+    location_service = LocationService(dev_mode=DEV_MODE)
+    ubicacion = location_service.update_edge_location()
 
     edge_location = {
         "lat": ubicacion["latitude"],
@@ -266,6 +326,8 @@ async def startup_event():
     mqtt_iot.loop_start()
     
     mqtt_back.connect(BROKER_IP, MQTT_PORT_BACK)
+    mqtt_back.on_message = on_message_back
+    mqtt_back.subscribe("foll/devices/+/incident-closed")
     mqtt_back.loop_start()
     
     asyncio.create_task(heartbeat_loop()) 

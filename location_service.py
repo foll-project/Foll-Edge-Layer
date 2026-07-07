@@ -1,22 +1,26 @@
+import os
 import subprocess
 import platform
 import requests
 import re
 
-# Ubicación fija para desarrollo local (sin llamadas a Google).
+# Ubicación fija solo si FOLL_DEV_MODE=true (pruebas sin Google).
 DEV_LOCATION = {
     "latitude": -12.0464,
     "longitude": -77.0428,
     "address": "Lima, Perú (ubicación fija — modo desarrollo)",
 }
 
+DEFAULT_GOOGLE_MAPS_API_KEY = "AIzaSyBDq3aQg2_PNMX-GiC1Y-d1oeZW4V2wXhs"
+
+
 class LocationService:
-    def __init__(self, api_key="AIzaSyBDq3aQg2_PNMX-GiC1Y-d1oeZW4V2wXhs", dev_mode=False):
+    def __init__(self, api_key: str | None = None, dev_mode: bool = False):
         """
-        Inicializa el servicio de localización profesional usando Google Maps Cloud.
-        En dev_mode=True retorna DEV_LOCATION sin consultar APIs externas.
+        Geolocalización vía Google Maps (WiFi + reverse geocoding).
+        Con dev_mode=True retorna DEV_LOCATION sin llamadas externas.
         """
-        self.api_key = api_key
+        self.api_key = api_key or os.getenv("GOOGLE_MAPS_API_KEY", DEFAULT_GOOGLE_MAPS_API_KEY)
         self.dev_mode = dev_mode
 
 
