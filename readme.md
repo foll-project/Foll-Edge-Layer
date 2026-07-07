@@ -10,6 +10,3 @@ Levantar broker:
 3. verficar que el servicio aparece en docket desktop, manejarlo desde ahi
 4. OPCIONAL: instalar MQTT Explorer para observar los eventos enviados al broker
 ![alt text](image.png)
-
-FALTA:
-- Autenticacion para permitir lectura *revisar
