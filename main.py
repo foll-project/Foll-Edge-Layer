@@ -1,6 +1,5 @@
-import threading
+import os
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
 from datetime import datetime
 import random
 import asyncio
@@ -27,25 +26,59 @@ FALL_TYPES = [
 def get_random_fall_type():
     return random.choice(FALL_TYPES)
 
-BROKER_IP = "127.0.0.1"
+DEV_MODE = os.getenv("FOLL_DEV_MODE", "true").lower() in ("1", "true", "yes")
 
-MQTT_PORT_BACK = 1884
+BROKER_IP = os.getenv("MQTT_BROKER_HOST", "127.0.0.1")
+MQTT_PORT_BACK = int(os.getenv("MQTT_BACK_PORT", "1884"))
 mqtt_back = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, "Foll_Edge_To_Back")
 
-MQTT_PORT_IOT = 1884
+MQTT_PORT_IOT = int(os.getenv("MQTT_IOT_PORT", "1884"))
 mqtt_iot = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, "Foll_Edge_Listener")
 
-devices_state = {
-    1001: {
-        "battery_level": 100,
-        "is_charging": False,
-        "location": {"lat": 0.0, "lng": 0.0},
-        "is_active": True,
-        "is_falling": False,
-        "last_seen": None
-    }
-}
+IOT_TOPIC_PREFIX = "iot/dispositivo_foll/"
+
+devices_state = {}
+edge_location = {"lat": 0.0, "lng": 0.0, "address": ""}
 state_lock = asyncio.Lock()
+
+
+def parse_iot_device_id(topic: str) -> int | None:
+    """Extrae device_id de iot/dispositivo_foll/{id}/..."""
+    if not topic.startswith(IOT_TOPIC_PREFIX):
+        return None
+    parts = topic.split("/")
+    if len(parts) < 4:
+        return None
+    try:
+        return int(parts[2])
+    except ValueError:
+        return None
+
+
+def parse_foll_device_id(topic: str) -> int | None:
+    """Extrae device_id de foll/devices/{id}/..."""
+    parts = topic.split("/")
+    if len(parts) < 3 or parts[0] != "foll" or parts[1] != "devices":
+        return None
+    try:
+        return int(parts[2])
+    except ValueError:
+        return None
+
+
+def ensure_device(device_id: int) -> dict:
+    if device_id not in devices_state:
+        devices_state[device_id] = {
+            "battery_level": 100,
+            "is_charging": False,
+            "location": {"lat": edge_location["lat"], "lng": edge_location["lng"]},
+            "address": edge_location.get("address", ""),
+            "is_active": True,
+            "is_falling": False,
+            "last_seen": None,
+        }
+        print(f"📱 Dispositivo registrado en Edge: {device_id}")
+    return devices_state[device_id]
 
 def publish_mqtt_iot(topic: str, data: dict):
     payload = json.dumps(data)
@@ -58,85 +91,110 @@ def publish_mqtt(topic: str, data: dict):
     print(f"📡 MQTT PUBLISH (Back) -> {topic} | Data: {payload}")
 
 
+def handle_user_cancel(device_id: int, timestamp: str | None = None) -> bool:
+    """Cierra la alerta activa: backend + comando al ESP32 para apagar buzzer."""
+    state = devices_state.get(device_id)
+    if not state or not state.get("is_falling"):
+        print(f"⚠️ [Edge] Cancel ignorada: no hay caída activa (dispositivo {device_id})")
+        return False
+
+    state["is_falling"] = False
+    print(f"🟢 [Edge] Caída cancelada (dispositivo {device_id}). Reseteando estado IA.")
+
+    ts = timestamp or datetime.utcnow().isoformat() + "Z"
+    back_payload = {
+        "device_id": device_id,
+        "timestamp": ts,
+        "reason": "USER_BUTTON_PRESSED",
+    }
+    publish_mqtt(f"foll/devices/{device_id}/fall-cancelled", back_payload)
+    publish_mqtt_iot(f"iot/dispositivo_foll/{device_id}/comandos", {"accion": "cancelar_caida"})
+    return True
+
+
 # --- CALLBACK PRINCIPAL MQTT ---
 def on_message_iot(client, userdata, msg):
     topic = msg.topic
-    device_id = 1001 # Hardcodeado por ahora según tu ESP32
-    
-    # 🚨 CASO 1: LLEGA LA VENTANA BINARIA DE LA IA (Cuidado: NO es JSON)
-    if topic == "iot/dispositivo_foll/ventana":
-        # Ignorar si ya estamos en estado de caída (para no saturar)
-        #if devices_state[device_id]["is_falling"]:
-            #return 
-            
-        print(f"\n📥 [MQTT] Recibidos {len(msg.payload)} bytes de acelerómetro.")
-        
-        # Le pasamos la memoria cruda a la IA
+
+    # CASO 1: ventana binaria de acelerómetro (ID en el tópico)
+    if topic.endswith("/ventana"):
+        device_id = parse_iot_device_id(topic)
+        if device_id is None:
+            print(f"⚠️ Tópico ventana sin device_id válido: {topic}")
+            return
+
+        state = ensure_device(device_id)
+        print(f"\n📥 [MQTT] Dispositivo {device_id} — {len(msg.payload)} bytes de acelerómetro.")
+
         resultado = detector.process(msg.payload)
-        
+
         if not resultado["ok"]:
-            return # Fallo al decodificar o tamaño incorrecto
-            
-        # Logging de la predicción en tiempo real
+            return
+
         is_fall = resultado["is_fall"]
         proba = resultado["proba"]
-        print(f"🧠 [IA] Predicción -> Caída: {is_fall} | Probabilidad: {proba:.4f}")
-        
+        print(f"🧠 [IA] Dispositivo {device_id} -> Caída: {is_fall} | Probabilidad: {proba:.4f}")
+
         if is_fall:
-            # ¡LA IA DETECTÓ CAÍDA! Cambiamos el estado (sin lock porque MQTT corre en su thread)
-            devices_state[device_id]["is_falling"] = True
-            
-            # 1. Hacer sonar el Buzzer en el ESP32
+            if state.get("is_falling"):
+                print(f"⏸️ [Edge] Caída ya activa (dispositivo {device_id}), ignorando duplicado.")
+                return
+
+            state["is_falling"] = True
+
             publish_mqtt_iot(f"iot/dispositivo_foll/{device_id}/comandos", {"accion": "caida"})
-            
-            # 2. Generar el log / payload que irá hacia Azure después
+
             fall_type = get_random_fall_type()
             fall_payload = {
                 "device_id": device_id,
                 "is_fall": True,
-                "ai_confidence_score": round(proba, 4), # Usamos la confianza REAL del modelo
-                "latitude": devices_state[device_id]["location"]["lat"],
-                "longitude": devices_state[device_id]["location"]["lng"],
+                "ai_confidence_score": round(proba, 4),
+                "latitude": state["location"]["lat"],
+                "longitude": state["location"]["lng"],
+                "address": state.get("address", ""),
                 "is_cancelled_by_user": False,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "fall_type_id": fall_type["id"],
             }
-            # Por ahora lo publicamos en el local back (1883), luego será en Azure
             publish_mqtt(f"foll/devices/{device_id}/fall-detected", fall_payload)
-            print(f"🚨 ¡ALERTA DISPARADA HACIA EL BACKEND! 🚨")
-            
-        return # Importante: Salimos aquí para que NO intente decodificar JSON abajo
+            print(f"🚨 ¡ALERTA DISPARADA (dispositivo {device_id}) HACIA EL BACKEND! 🚨")
 
-    # 🟢 CASO 2: LLEGA TELEMETRÍA JSON NORMAL
+        return
+
+    # CASO 2: mensajes JSON (telemetría, power, cancel)
     try:
         payload = json.loads(msg.payload.decode())
+        device_id = parse_iot_device_id(topic) or parse_foll_device_id(topic)
+        payload_device_id = payload.get("device_id")
 
-        if topic == "iot/dispositivo_foll/telerimetria":
-            if device_id in devices_state:
-                devices_state[device_id]["battery_level"] = payload.get("bateria", 0)
-                devices_state[device_id]["is_charging"] = payload.get("is_charging", False)
-                devices_state[device_id]["last_seen"] = datetime.utcnow()
-                
-                if not devices_state[device_id]["is_falling"]:
-                    gps = payload.get("gps", {})
-                    devices_state[device_id]["location"]["lat"] = gps.get("lat", 0.0)
-                    devices_state[device_id]["location"]["lng"] = gps.get("lon", 0.0)
+        if payload_device_id is not None and device_id is not None:
+            if int(payload_device_id) != device_id:
+                print(f"⚠️ device_id inconsistente: tópico={device_id}, payload={payload_device_id}")
+                return
+            device_id = int(payload_device_id)
+        elif device_id is None and payload_device_id is not None:
+            device_id = int(payload_device_id)
+        elif device_id is None:
+            print(f"⚠️ Mensaje JSON sin device_id identificable: {topic}")
+            return
 
-        elif topic == "foll/devices/1001/power":
-            if device_id in devices_state:
-                devices_state[device_id]["is_active"] = payload.get("is_active", False)
-                publish_mqtt(f"foll/devices/{device_id}/power", payload)
+        ensure_device(device_id)
 
-        elif topic == "foll/devices/1001/cancel_events":
-            if device_id in devices_state and payload.get("is_cancelled_by_user") == True:
-                devices_state[device_id]["is_falling"] = False
-                print(f"🟢 [Edge] Caída cancelada. Reseteando estado IA.")
-                back_payload = {
-                    "device_id": device_id,
-                    "timestamp": payload.get("timestamp", datetime.utcnow().isoformat() + "Z"),
-                    "reason": "USER_BUTTON_PRESSED"
-                }
-                publish_mqtt(f"foll/devices/{device_id}/fall-cancelled", back_payload)
+        if topic.endswith("/telemetria"):
+            devices_state[device_id]["battery_level"] = payload.get("bateria", devices_state[device_id]["battery_level"])
+            devices_state[device_id]["is_charging"] = payload.get("is_charging", False)
+            devices_state[device_id]["last_seen"] = datetime.utcnow()
+
+        elif topic.endswith("/power"):
+            devices_state[device_id]["is_active"] = payload.get("is_active", False)
+            publish_mqtt(f"foll/devices/{device_id}/power", payload)
+
+        elif topic.endswith("/cancelar"):
+            if payload.get("is_cancelled_by_user") is True:
+                handle_user_cancel(
+                    device_id,
+                    payload.get("timestamp"),
+                )
 
     except Exception as e:
         print(f"⚠️ Error procesando mensaje IoT JSON: {e}")
@@ -175,38 +233,35 @@ async def cancel_fall(device_id: int):
     async with state_lock:
         if not devices_state[device_id].get("is_active", True):
             raise HTTPException(status_code=409, detail="Device is powered off")
-        devices_state[device_id]["is_falling"] = False
-    
-    payload = {
-        "device_id": device_id,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "reason": "USER_BUTTON_PRESSED"
-    }
-    publish_mqtt(f"foll/devices/{device_id}/fall-cancelled", payload)
-    publish_mqtt_iot(f"iot/dispositivo_foll/{device_id}/comandos", {"accion": "cancelar_caida"})
+
+    if not handle_user_cancel(device_id):
+        raise HTTPException(status_code=409, detail="No active fall alert to cancel")
+
     return {"status": "Alerta cancelada. IA lista para nueva detección."}
 
 
 @app.on_event("startup")
 async def startup_event():
-    print("📍 Inicializando servicio de geolocalización de alta precisión...")
-    loc_service = LocationService()
-    ubicacion = loc_service.update_edge_location()
-    
-    devices_state[1001]["location"]["lat"] = ubicacion["latitude"]
-    devices_state[1001]["location"]["lng"] = ubicacion["longitude"]
-    devices_state[1001]["address"] = ubicacion["address"]
-    print(f"📍 [Capa Edge] Ubicación fija de la estación: {ubicacion['address']}")
+    global edge_location
 
+    if DEV_MODE:
+        print("🔧 Modo desarrollo activo (FOLL_DEV_MODE=true). MQTT local + ubicación hardcodeada.")
+    loc_service = LocationService(dev_mode=DEV_MODE)
+    ubicacion = loc_service.update_edge_location()
+
+    edge_location = {
+        "lat": ubicacion["latitude"],
+        "lng": ubicacion["longitude"],
+        "address": ubicacion["address"],
+    }
+    print(f"📍 [Capa Edge] Ubicación de la estación: {ubicacion['address']}")
 
     mqtt_iot.connect(BROKER_IP, MQTT_PORT_IOT)
-    
-    # 🚨 LA SUSCRIPCIÓN MÁS IMPORTANTE AHORA:
-    mqtt_iot.subscribe("iot/dispositivo_foll/ventana") 
-    
-    mqtt_iot.subscribe("iot/dispositivo_foll/telerimetria")
-    mqtt_iot.subscribe("foll/devices/1001/power")
-    mqtt_iot.subscribe("foll/devices/1001/cancel_events") 
+
+    mqtt_iot.subscribe(f"{IOT_TOPIC_PREFIX}+/ventana")
+    mqtt_iot.subscribe(f"{IOT_TOPIC_PREFIX}+/telemetria")
+    mqtt_iot.subscribe("foll/devices/+/power")
+    mqtt_iot.subscribe(f"{IOT_TOPIC_PREFIX}+/cancelar")
     
     mqtt_iot.loop_start()
     

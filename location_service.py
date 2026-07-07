@@ -3,13 +3,21 @@ import platform
 import requests
 import re
 
+# Ubicación fija para desarrollo local (sin llamadas a Google).
+DEV_LOCATION = {
+    "latitude": -12.0464,
+    "longitude": -77.0428,
+    "address": "Lima, Perú (ubicación fija — modo desarrollo)",
+}
+
 class LocationService:
-    def __init__(self, api_key="AIzaSyBDq3aQg2_PNMX-GiC1Y-d1oeZW4V2wXhs"):
+    def __init__(self, api_key="AIzaSyBDq3aQg2_PNMX-GiC1Y-d1oeZW4V2wXhs", dev_mode=False):
         """
         Inicializa el servicio de localización profesional usando Google Maps Cloud.
-        REEMPLAZA 'TU_API_KEY_DE_GOOGLE_AQUI' con la clave que copiaste de la consola.
+        En dev_mode=True retorna DEV_LOCATION sin consultar APIs externas.
         """
         self.api_key = api_key
+        self.dev_mode = dev_mode
 
 
     def get_wifi_networks(self):
@@ -131,6 +139,10 @@ class LocationService:
         """
         Orquestador principal: Obtiene coordenadas precisas y dirección legible por humanos.
         """
+        if self.dev_mode:
+            print("📍 [DEV] Usando ubicación hardcodeada (sin llamada a Google).")
+            return dict(DEV_LOCATION)
+
         print("🚀 [Google Maps] Solicitando geolocalización de alta precisión...")
         lat, lon = self.get_location_google()
         
